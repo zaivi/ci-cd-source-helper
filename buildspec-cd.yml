@@ -1,0 +1,56 @@
+version: 0.2
+
+env:
+    parameter-store:
+        BITBUCKET_USER: masterpipeline_bitbucket_user
+        BITBUCKET_TOKEN: masterpipeline_bitbucket_token
+
+phases:
+    pre_build:
+        commands:
+            # IMPORT ENVIRONMENT VARIABLES FROM ARTIFACTS
+            - |
+                VARIABLES_FILE="$(pwd)/ci_environment_variables.txt"
+
+                if [ -f "$VARIABLES_FILE" ]; then
+                  echo "Inherit environment variables from CI stage"
+                  source "$VARIABLES_FILE"
+                else
+                  echo "Could not find $VARIABLES_FILE"
+                fi
+
+            # CHECK FOR ENVIRONMENT VARIABLES AFTER IMPORT
+            - export
+
+    build:
+        commands:
+            # RUN CD CONDITION CHECKING
+            - |
+                if [ ${SHOULD_RUN_CD} == "true" ]; then
+                  echo "RUNNING THE CD STAGE"
+
+                  # CLONE THE ARGOCD REPOSITORY TO A ARGOCD_REPOSITORY DIRECTORY
+                  git clone https://${BITBUCKET_USER}:${BITBUCKET_TOKEN}@${GIT_CONFIG_REPO}.git argocd_repository
+
+                  # SET THE DISPLAYED USER WITH THE COMMITS THAT ARE ABOUT TO BE MADE
+                  git config --global user.email "bot@teragroup.io"
+                  git config --global user.name "bot-argocd"
+
+                  # CHANGE PATH TO ARGOCD_REPOSITORY & CHECK CONFIG FILE
+                  cd argocd_repository
+                  cat ${SERVICE_CONFIG_FILE}
+
+                  # REPLACE CURRENT IMAGE TAG WITH NEW IMAGE TAG          
+                  echo "Reply current Tag image to ${IMAGE_COMMIT_HASH}"
+                  sed -i "s/tag: \"[^\"]*\"/tag: \"${IMAGE_COMMIT_HASH}\"/" ${SERVICE_CONFIG_FILE}
+                  git add -A
+                  git commit -m "ArgoCD push new ${SERVICE_NAME} image tag ${IMAGE_COMMIT_HASH}"
+                  git push
+
+                  # RECHECK AFTER DEPLOY
+                  cat ${SERVICE_CONFIG_FILE}
+
+                else
+                  echo "SKIP CD STATE DUE TO SHOULD_RUN_CD == ${SHOULD_RUN_CD}"
+
+                fi

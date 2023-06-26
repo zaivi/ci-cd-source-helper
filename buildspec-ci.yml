@@ -1,0 +1,169 @@
+version: 0.2
+
+env:
+    git-credential-helper: yes
+    # GET GLOBAL VARIABLES ON SSM PARAMETERS STORAGE
+    parameter-store:
+        INFRA_PIPELINE_ACCOUNT_ID: /master_pipeline_ssm/infras_pipeline_accountid
+        COMMONSVC_NONPRD_ACCOUNT_ID: /master_pipeline_ssm/common_services_nonprod_accountid
+        COMMONSVC_PRD_ACCOUNT_ID: /master_pipeline_ssm/common_services_prod_accountid
+        NONPRD_DOCKER_REGISTRY: /master_pipeline_ssm/nonprd_docker_registry
+        PRD_DOCKER_REGISTRY: /master_pipeline_ssm/prd_docker_registry
+
+        # TEMPORARY FOR TESTING
+        TERA_TOKEN_TYPE: /temporary/tera_token_type
+        TERA_MAVEN_TOKEN: /temporary/tera_maven_token
+
+    variables:
+        # GITLAB MAVEN REPOSITORY
+        MAVEN_CLI_OPTS: "--show-version --threads 1C --batch-mode -s .m2/settings-codeartifact.xml"
+        MAVEN_OPTS: "-Ddependency-check.skip=true"
+
+# cache:
+#   paths:
+#     - '/root/.m2/**/*'
+
+phases:
+    # INSTALL RUNTIME ENVIRONMENT
+    install:
+        runtime-versions:
+            java: corretto17
+
+    pre_build:
+        commands:
+            # VERIFY WHICH IS TRIGGER SOURCE
+            - |
+                # GET THE S3 OBJECT ID VERSION
+                CURRENT_NONPRD_S3_OBJECT_ID=$(aws s3api list-object-versions --bucket ${S3_BUCKET} --prefix ${NONPRD_S3_OBJECT_PATH}/${SERVICE_NAME}.zip --query 'Versions[?IsLatest].[VersionId]' --output text)
+                CURRENT_PRD_S3_OBJECT_ID=$(aws s3api list-object-versions --bucket ${S3_BUCKET} --prefix ${PRD_S3_OBJECT_PATH}/${SERVICE_NAME}.zip --query 'Versions[?IsLatest].[VersionId]' --output text)
+
+                # GET THE PREVIOUS S3 OBJECT ID VERSION
+                PREV_NONPRD_S3_OBJECT_ID=$(aws ssm get-parameter --name ${NONPRD_SSM_OBJECT_PATH} --query "Parameter.Value" --output text)
+                PREV_PRD_S3_OBJECT_ID=$(aws ssm get-parameter --name ${PRD_SSM_OBJECT_PATH} --query "Parameter.Value" --output text)
+
+                # CHECK SOURCE TRIGGER BY COMPARE S3 & SSM VERSION
+                if [ ${CURRENT_NONPRD_S3_OBJECT_ID} != ${PREV_NONPRD_S3_OBJECT_ID} ] || [ ${CURRENT_PRD_S3_OBJECT_ID} != ${PREV_PRD_S3_OBJECT_ID} ]; then
+                  echo "==> The CodePipeline is trigger from S3"
+                  echo "Change current shell path to: $CODEBUILD_SRC_DIR_s3_artifacts"
+                  cd ${CODEBUILD_SRC_DIR_s3_artifacts}
+                  
+                else
+                  echo "==>The CodePipeline is trigger from BitBucket"
+
+                fi
+
+            # GET & SET ENVIRONMENT VARIABLES FROM source_trigger_environment_variables.txt FILE
+            - |
+                VARIABLES_FILE="$(pwd)/source_trigger_environment_variables.txt"
+
+                if [ -f "$VARIABLES_FILE" ]; then
+                  echo "Contents of $VARIABLES_FILE:"
+                  cat "$VARIABLES_FILE"
+                  source "$VARIABLES_FILE"
+                else
+                  echo "Could not find $VARIABLES_FILE"
+                  CODEBUILD_WEBHOOK_HEAD_REF="refs/heads/${DEFAULT_BRANCH}"
+                fi
+
+            # DEFIND VARIABLES FOR IMAGES
+            - IMAGE_COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+
+            # DEFINE MAPPING VALUES CORRESPONDING TO BRANCHES
+            - |
+                case ${CODEBUILD_WEBHOOK_HEAD_REF} in
+
+                  # Dev Branch
+                  "refs/heads/develop")
+                      SHOULD_RUN_CD="true"
+                      ECR_REGISTRY="${NONPRD_DOCKER_REGISTRY}"
+                      GIT_CONFIG_REPO="bitbucket.org/teragroupvn/ontv-dev-argocd-workflow"
+                      SERVICE_CONFIG_FILE="deployment/templates/content-exploration-service.yaml"
+                    ;;
+
+                  # Master Branch
+                  "refs/heads/master")
+                      SHOULD_RUN_CD="false"
+                      ECR_REGISTRY="${PRD_DOCKER_REGISTRY}"
+                      GIT_CONFIG_REPO="bitbucket.org/teragroupvn/ontv-dev-argocd-workflow"
+                      SERVICE_CONFIG_FILE="deployment/templates/content-exploration-service.yaml"
+                    ;;
+
+                  # Hotfix Branch
+                  "refs/heads/hotfix")
+                      SHOULD_RUN_CD="false"
+                      ECR_REGISTRY="${PRD_DOCKER_REGISTRY}"
+                      GIT_CONFIG_REPO="bitbucket.org/teragroupvn/ontv-dev-argocd-workflow"
+                      SERVICE_CONFIG_FILE="deployment/templates/content-exploration-service.yaml"
+                    ;;
+
+                  # Tagging
+                  "refs/tags/"*)
+                      SHOULD_RUN_CD="false"
+                      ECR_REGISTRY="${PRD_DOCKER_REGISTRY}"
+                      GIT_CONFIG_REPO="bitbucket.org/teragroupvn/ontv-dev-argocd-workflow"
+                      SERVICE_CONFIG_FILE="deployment/templates/content-exploration-service.yaml"
+                    ;;
+
+                  # Default
+                  *)
+                      SHOULD_RUN_CD="false"
+                      ECR_REGISTRY="${NONPRD_DOCKER_REGISTRY}"
+                      GIT_CONFIG_REPO="bitbucket.org/teragroupvn/ontv-dev-argocd-workflow"
+                      SERVICE_CONFIG_FILE="deployment/templates/content-exploration-service.yaml"
+                    ;;
+
+                esac
+
+    build:
+        commands:
+            # GET ECR AND CODEARTIFACT TOKEN
+            - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            - export CODEARTIFACT_AUTH_TOKEN=`aws codeartifact get-authorization-token --domain teragroup --domain-owner 016080345938 --region ap-southeast-1 --query authorizationToken --output text`
+
+            # STAGE MAVEN BUILD
+            - |
+                if [[ ${CODEBUILD_WEBHOOK_HEAD_REF} == "refs/heads/develop" ]] || \
+                   [[ ${CODEBUILD_WEBHOOK_HEAD_REF} == "refs/heads/develop-nas" ]] || \
+                   [[ ${GIT_TAG_VERSION} != "None" ]]; then
+
+                  mvn ${MAVEN_CLI_OPTS} ${MAVEN_OPTS} clean install
+                fi
+
+            # STAGE DOCKER BUILD DEV $ RELEASE
+            - |
+                if [[ ${CODEBUILD_WEBHOOK_HEAD_REF} == "refs/heads/develop" ]] || \
+                   [[ ${CODEBUILD_WEBHOOK_HEAD_REF} == "refs/heads/develop-nas" ]] || \
+                   [[ ${GIT_TAG_VERSION} != "None" ]]; then
+
+                  docker build -t ${ECR_REGISTRY}/${PROJECT}/${SERVICE_NAME}:${IMAGE_COMMIT_HASH} .
+                  echo "Pushing image to ECR..."
+                  docker push ${ECR_REGISTRY}/${PROJECT}/${SERVICE_NAME}:${IMAGE_COMMIT_HASH}
+                  echo "Pushed new image to ECR"
+                fi
+
+    post_build:
+        commands:
+            # EXPORT CODEBUILD CI ENVIRONMENT VARIABLES TO ARTIFACTS
+            - |
+                export
+                export > ${CODEBUILD_SRC_DIR}/ci_environment_variables.txt
+
+        finally:
+            # UPDATE SSM PARAMS TO LATEST OBJECT ID
+            - |
+                if [ ${CURRENT_NONPRD_S3_OBJECT_ID} != ${PREV_NONPRD_S3_OBJECT_ID} ] || [ ${CURRENT_PRD_S3_OBJECT_ID} != ${PREV_PRD_S3_OBJECT_ID} ]; then
+                  echo "==> The CodePipeline is trigger from S3"
+                  echo "Update SSM PARAMS to latest version"
+                  aws ssm put-parameter --name "${NONPRD_SSM_OBJECT_PATH}" --value "${CURRENT_NONPRD_S3_OBJECT_ID}" --type "String" --overwrite
+                  aws ssm put-parameter --name "${PRD_SSM_OBJECT_PATH}" --value "${CURRENT_PRD_S3_OBJECT_ID}" --type "String" --overwrite
+
+                else
+                  echo "==> Do not update SSM Params due to trigger from BitBucket"
+
+                fi
+
+artifacts:
+    files:
+        - ci_environment_variables.txt
+        - devops/buildspec-cd.yml
+    base-directory: .

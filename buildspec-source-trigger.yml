@@ -1,0 +1,69 @@
+version: 0.2
+
+env:
+    git-credential-helper: yes
+
+    variables:
+        S3_NONPRD_SUB_BRANCHES: "refs/heads/test refs/heads/sit"
+        S3_PRD_SUB_BRANCHES: "refs/heads/stg refs/heads/uat refs/heads/hotfix refs/heads/release"
+
+phases:
+    pre_build:
+        commands:
+            # GET ENVIRONMENT TO FILE
+            - export FILTER_CODEBUILD_WEBHOOK_HEAD_REF=$(echo $CODEBUILD_WEBHOOK_HEAD_REF | cut -d/ -f1-3)
+            - echo CODEBUILD_WEBHOOK_HEAD_REF="${FILTER_CODEBUILD_WEBHOOK_HEAD_REF}" > source_trigger_environment_variables.txt
+            - echo CODEBUILD_RESOLVED_SOURCE_VERSION="${CODEBUILD_RESOLVED_SOURCE_VERSION}" >> source_trigger_environment_variables.txt
+
+            # GET GIT METADATA
+            - |
+                GIT_DIR=$(sed -n 's/^gitdir: //p' .git)
+                rm -f .git
+                cp -r $GIT_DIR .
+
+            # CHECK AND GET THE TAGGING VERSION IF TAG FROM MASTER BRANCH
+            - |
+                if [[ "${CODEBUILD_WEBHOOK_HEAD_REF}" == "refs/tags/"* ]]; then
+                  if git branch --contains "${CODEBUILD_RESOLVED_SOURCE_VERSION}" | grep -q "master"; then
+                    GIT_TAG_VERSION=$(echo ${CODEBUILD_WEBHOOK_HEAD_REF} | cut -d'/' -f3)
+                    echo GIT_TAG_VERSION="${GIT_TAG_VERSION}" >> source_trigger_environment_variables.txt
+                  else
+                    echo GIT_TAG_VERSION="None" >> source_trigger_environment_variables.txt
+                  fi
+                else
+                  echo GIT_TAG_VERSION="None" >> source_trigger_environment_variables.txt
+                fi
+
+    build:
+        commands:
+            - cat source_trigger_environment_variables.txt
+            - zip -r ${SERVICE_NAME}.zip . > /dev/null
+
+            # PUSH TO PROD ENVIRONMENT FOR TAG
+            - |
+                if [[ "${CODEBUILD_WEBHOOK_HEAD_REF}" == "refs/tags/"* ]]; then
+                  if git branch --contains "${CODEBUILD_RESOLVED_SOURCE_VERSION}" | grep -q "master"; then
+                    echo "Upload file to ${S3_BUCKET}/${PRD_S3_OBJECT_PATH}"
+                    aws s3 cp ${SERVICE_NAME}.zip s3://${S3_BUCKET}/${PRD_S3_OBJECT_PATH}/
+                    exit 0
+                  fi
+                fi
+
+            # DEBUGGING
+            - ls -la
+            - export
+
+            # CHECK WHICH IS THE TRIGGER BRANCH AND UPLOAD TO CORRESPONDING ENVIRONMENT
+            - |
+                if eval echo ${S3_NONPRD_SUB_BRANCHES} | grep -wq ${FILTER_CODEBUILD_WEBHOOK_HEAD_REF}; then
+                  echo "Upload file to ${S3_BUCKET}/${NONPRD_S3_OBJECT_PATH}"
+                  aws s3 cp ${SERVICE_NAME}.zip s3://${S3_BUCKET}/${NONPRD_S3_OBJECT_PATH}/
+
+                elif eval echo ${S3_PRD_SUB_BRANCHES} | grep -wq ${FILTER_CODEBUILD_WEBHOOK_HEAD_REF}; then
+                  echo "Upload file to ${S3_BUCKET}/${PRD_S3_OBJECT_PATH}"
+                  aws s3 cp ${SERVICE_NAME}.zip s3://${S3_BUCKET}/${PRD_S3_OBJECT_PATH}/
+
+                else
+                  echo "${CODEBUILD_WEBHOOK_HEAD_REF} is not belong to Prd or NonPrd Branches"
+
+                fi
